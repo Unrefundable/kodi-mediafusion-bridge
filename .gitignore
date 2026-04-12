@@ -1,0 +1,11 @@
+# Python cache
+lib/__pycache__/
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
+
+# build output
+*.zip

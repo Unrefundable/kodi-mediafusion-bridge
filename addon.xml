@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<addon id="plugin.video.mediafusion.bridge" version="1.0.0" name="MediaFusion Bridge" provider-name="local">
+    <requires>
+        <import addon="xbmc.python" version="3.0.0"/>
+        <import addon="script.module.requests" version="2.9.1"/>
+        <import addon="plugin.video.mediafusion"/>
+    </requires>
+    <!-- Plugin source: answers play requests from TMDb Bingie Helper -->
+    <extension point="xbmc.python.pluginsource" library="default.py">
+        <provides>video</provides>
+    </extension>
+    <!-- Service: monitors playback progress and applies resume seeks -->
+    <extension point="xbmc.service" library="service.py" start="login"/>
+    <extension point="xbmc.addon.metadata">
+        <summary lang="en_GB">MediaFusion Bridge - Auto-play with resume</summary>
+        <description lang="en_GB">
+            Bridges MediaFusion with the Bingie skin / TMDb Bingie Helper.
+            Automatically picks the best Real-Debrid stream without showing the
+            selection dialog, caches the chosen stream URL, and resumes playback
+            from the position tracked by Trakt.
+        </description>
+        <platform>all</platform>
+    </extension>
+</addon>

@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<settings version="2">
+    <!-- Stream URL cache duration in hours (0 = always re-fetch) -->
+    <setting id="stream_cache_ttl_hours" type="number" label="Stream cache duration (hours)" default="6">
+        <constraints min="0" max="48" step="1"/>
+    </setting>
+    <!-- If enabled, show a notification when a cached stream is used instead of fetching fresh -->
+    <setting id="notify_cache_hit" type="bool" label="Notify on cache hit" default="false"/>
+</settings>
