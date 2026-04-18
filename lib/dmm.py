@@ -109,7 +109,7 @@ def _get_rd_timestamp(api_token=None):
     """
     try:
         requests = _get_requests()
-        resp = requests.get(f"{_RD_BASE}/time/iso", timeout=5)
+        resp = requests.get(f"{_RD_BASE}/time/iso", timeout=3)
         resp.raise_for_status()
         from datetime import datetime, timezone
         iso = resp.text.strip().strip('"')
@@ -166,18 +166,24 @@ def _rd_headers(api_token):
     return {"Authorization": f"Bearer {api_token}"}
 
 
-def _rd_get(path, api_token, timeout=15):
+def _rd_get(path, api_token, timeout=6):
     requests = _get_requests()
     r = requests.get(f"{_RD_BASE}{path}", headers=_rd_headers(api_token), timeout=timeout)
     r.raise_for_status()
+    text = r.text.strip()
+    if not text:
+        return {}
     return r.json()
 
 
-def _rd_post(path, api_token, data=None, timeout=15):
+def _rd_post(path, api_token, data=None, timeout=6):
     requests = _get_requests()
     r = requests.post(f"{_RD_BASE}{path}", headers=_rd_headers(api_token),
                       data=data or {}, timeout=timeout)
     r.raise_for_status()
+    text = r.text.strip()
+    if not text:
+        return {}
     return r.json()
 
 
@@ -295,15 +301,16 @@ def _availability_is_usable(api_token, hashes):
         return {}, False
 
 
+def _cancelled(cancel_event):
+    return cancel_event and cancel_event.is_set()
+
+
 def _resolve_by_direct_add(candidates_info, api_token, season=None, episode=None,
                            max_resolve=3, cancel_event=None):
     """
     Resolve streams by adding magnets to RD and checking for instant cache.
-    Uses tight 5s timeouts per request.  Checks at most `len(candidates_info)`
-    candidates (caller should already limit to 5).
-    cancel_event: threading.Event – set it to abort early.
+    cancel_event: threading.Event – checked between every RD API call.
     """
-    import time as _t
     resolved = []
     video_exts = (".mkv", ".mp4", ".avi", ".m4v", ".webm", ".ts")
     ep_markers = []
@@ -314,7 +321,7 @@ def _resolve_by_direct_add(candidates_info, api_token, season=None, episode=None
         ]
 
     for idx, c in enumerate(candidates_info):
-        if cancel_event and cancel_event.is_set():
+        if _cancelled(cancel_event):
             _log("Direct-add cancelled")
             break
         if len(resolved) >= max_resolve:
@@ -325,13 +332,23 @@ def _resolve_by_direct_add(candidates_info, api_token, season=None, episode=None
         try:
             magnet = f"magnet:?xt=urn:btih:{c['hash']}"
             resp = _rd_post("/torrents/addMagnet", api_token,
-                            data={"magnet": magnet}, timeout=8)
+                            data={"magnet": magnet})
             rd_id = resp.get("id")
             if not rd_id:
+                _log(f"{c['hash'][:8]} addMagnet returned no id: {resp}")
                 continue
 
-            info = _rd_get(f"/torrents/info/{rd_id}", api_token, timeout=8)
+            if _cancelled(cancel_event):
+                _rd_delete(f"/torrents/delete/{rd_id}", api_token)
+                break
+
+            info = _rd_get(f"/torrents/info/{rd_id}", api_token)
             status = info.get("status", "")
+            _log(f"{c['hash'][:8]} status after addMagnet: {status!r}")
+
+            if _cancelled(cancel_event):
+                _rd_delete(f"/torrents/delete/{rd_id}", api_token)
+                break
 
             # If already downloaded (was in cache), skip file selection
             if status == "downloaded":
@@ -359,33 +376,43 @@ def _resolve_by_direct_add(candidates_info, api_token, season=None, episode=None
                             best_size = fsize
                             best_file_id = f.get("id")
                 if not best_file_id:
-                    _rd_delete(f"/torrents/delete/{rd_id}", api_token, timeout=5)
+                    _log(f"{c['hash'][:8]} no video file found in {len(files)} files")
+                    _rd_delete(f"/torrents/delete/{rd_id}", api_token)
                     continue
 
                 _rd_post(f"/torrents/selectFiles/{rd_id}", api_token,
-                         data={"files": str(best_file_id)}, timeout=8)
-                _t.sleep(1.5)
-                info = _rd_get(f"/torrents/info/{rd_id}", api_token, timeout=8)
+                         data={"files": str(best_file_id)})
+
+                if _cancelled(cancel_event):
+                    _rd_delete(f"/torrents/delete/{rd_id}", api_token)
+                    break
+
+                info = _rd_get(f"/torrents/info/{rd_id}", api_token)
                 if info.get("status") != "downloaded":
                     _log(f"{c['hash'][:8]} not cached (status={info.get('status')!r})")
-                    _rd_delete(f"/torrents/delete/{rd_id}", api_token, timeout=5)
+                    _rd_delete(f"/torrents/delete/{rd_id}", api_token)
                     continue
             else:
                 # Not cached – magnet_conversion / queued / etc.
-                _log(f"{c['hash'][:8]} status={status!r} – not instantly cached")
-                _rd_delete(f"/torrents/delete/{rd_id}", api_token, timeout=5)
+                _log(f"{c['hash'][:8]} not instantly cached")
+                _rd_delete(f"/torrents/delete/{rd_id}", api_token)
                 continue
 
             links = info.get("links") or []
             if not links:
-                _rd_delete(f"/torrents/delete/{rd_id}", api_token, timeout=5)
+                _log(f"{c['hash'][:8]} no links in torrent info")
+                _rd_delete(f"/torrents/delete/{rd_id}", api_token)
                 continue
 
+            if _cancelled(cancel_event):
+                _rd_delete(f"/torrents/delete/{rd_id}", api_token)
+                break
+
             unrestrict = _rd_post("/unrestrict/link", api_token,
-                                   data={"link": links[0]}, timeout=8)
+                                   data={"link": links[0]})
             url = unrestrict.get("download")
             filename = unrestrict.get("filename", c.get("title", "Stream"))
-            _rd_delete(f"/torrents/delete/{rd_id}", api_token, timeout=5)
+            _rd_delete(f"/torrents/delete/{rd_id}", api_token)
 
             if url:
                 _log(f"Direct-add resolve OK: {filename!r}")
@@ -394,10 +421,7 @@ def _resolve_by_direct_add(candidates_info, api_token, season=None, episode=None
         except Exception as exc:
             _log(f"Direct-add failed for {c.get('hash','')[:8]}: {exc}", xbmc.LOGWARNING)
             if rd_id:
-                try:
-                    _rd_delete(f"/torrents/delete/{rd_id}", api_token, timeout=5)
-                except Exception:
-                    pass
+                _rd_delete(f"/torrents/delete/{rd_id}", api_token)
 
     return resolved
 

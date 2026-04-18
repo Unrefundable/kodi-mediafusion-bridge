@@ -1,6 +1,6 @@
 <?xml version='1.0' encoding='utf-8'?>
 <addons>
-    <addon id="plugin.video.kdmm" version="2.2.3" name="KDMM" provider-name="Unrefundable">
+    <addon id="plugin.video.kdmm" version="2.2.4" name="KDMM" provider-name="Unrefundable">
     <requires>
         <import addon="xbmc.python" version="3.0.0" />
         <import addon="script.module.requests" version="2.9.1" />
