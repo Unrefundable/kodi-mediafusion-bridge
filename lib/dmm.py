@@ -276,33 +276,15 @@ def _combine_hashes(h1, h2):
     return obfuscated
 
 
-def _get_rd_timestamp(api_token=None):
-    """
-    Fetch the current unix timestamp from Real-Debrid's time API.
-    DMM's server uses this same source for token validation, so we must too.
-    Falls back to local time if the request fails.
-    """
-    try:
-        s = _get_session()
-        resp = s.get(f"{_RD_BASE}/time/iso", timeout=3)
-        resp.raise_for_status()
-        from datetime import datetime, timezone
-        iso = resp.text.strip().strip('"')
-        dt = datetime.fromisoformat(iso.replace('Z', '+00:00'))
-        return int(dt.timestamp())
-    except Exception as exc:
-        _log(f"RD time fetch failed, using local clock: {exc}", xbmc.LOGWARNING)
-        return int(_time.time())
-
-
 def _generate_token_and_hash(api_token=None):
     """
     Generate a (tokenWithTimestamp, combinedHash) pair accepted by DMM's API.
-    Timestamp is sourced from RD's time API to stay in sync with DMM's validation.
+    Uses the local system clock for the timestamp — a Mac is NTP-synced so
+    it matches DMM's server clock.  No RD API call needed here.
     """
     import random
     token = format(random.getrandbits(32), "x")
-    timestamp = _get_rd_timestamp(api_token)
+    timestamp = int(_time.time())
     token_with_ts = f"{token}-{timestamp}"
     ts_hash = _dmm_hash(token_with_ts)
     salt_hash = _dmm_hash(f"{_DMM_SALT}-{token}")
@@ -635,13 +617,14 @@ def _resolve_by_direct_add(candidates_info, api_token, season=None, episode=None
         batch = candidates_info[batch_start:batch_start + batch_size]
         _log(f"Batch {batch_start // batch_size + 1}: candidates {batch_start + 1}-{batch_start + len(batch)}")
 
-        with ThreadPoolExecutor(max_workers=batch_size) as pool:
-            futures = {
-                pool.submit(
-                    _try_resolve_one, c, api_token, season, episode, combined
-                ): c
-                for c in batch
-            }
+        pool = ThreadPoolExecutor(max_workers=batch_size)
+        futures = {
+            pool.submit(
+                _try_resolve_one, c, api_token, season, episode, combined
+            ): c
+            for c in batch
+        }
+        try:
             for future in as_completed(futures):
                 result = future.result()
                 if result:
@@ -652,6 +635,13 @@ def _resolve_by_direct_add(candidates_info, api_token, season=None, episode=None
                 if _cancelled(cancel_event):
                     enough_event.set()
                     break
+        finally:
+            # Shut down immediately — do NOT wait for remaining threads.
+            # This is the key fix: without wait=False, the executor blocks
+            # here until all threads finish even though we already have a result.
+            for f in futures:
+                f.cancel()
+            pool.shutdown(wait=False)
 
         if enough_event.is_set():
             break
@@ -787,12 +777,6 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None):
     imdb_id = parts[0]
     season = parts[1] if len(parts) > 1 else None
     episode = parts[2] if len(parts) > 2 else None
-
-    # Pre-warm the session (SSL handshake) with a fast RD endpoint
-    try:
-        _get_session().head(f"{_RD_BASE}/time", headers=_rd_headers(api_token), timeout=3)
-    except Exception:
-        pass
 
     # 1. Get all hashes from DMM
     try:
