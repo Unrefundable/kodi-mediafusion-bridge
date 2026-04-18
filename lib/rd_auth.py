@@ -11,6 +11,7 @@ then stores the resulting tokens in a JSON file in addon_data
 import json
 import os
 import sys
+import threading
 import time
 
 import xbmc
@@ -77,38 +78,61 @@ def authorize():
     Run the full RD device-code OAuth flow.
     Returns True on success, False on cancel/error.
     """
-    try:
-        requests = _get_requests()
-    except Exception as exc:
-        _log(f"Failed to import requests: {exc}", xbmc.LOGERROR)
-        xbmcgui.Dialog().ok("KDMM", f"Import error: {type(exc).__name__}: {exc}")
-        return False
+    # Show a "connecting" dialog immediately so Kodi feels responsive
+    busy = xbmcgui.DialogProgress()
+    busy.create("KDMM – Real-Debrid", "Connecting to Real-Debrid…")
 
-    # 1. Request a device code
-    try:
-        resp = requests.get(
-            f"{_RD_OAUTH_BASE}/device/code",
-            params={"client_id": _CLIENT_ID, "new_credentials": "yes"},
-            timeout=15,
-        )
-        resp.raise_for_status()
-        data = resp.json()
-    except Exception as exc:
+    # Fetch device code on a background thread so Kodi UI doesn't freeze
+    fetch_result = {}
+
+    def _fetch_device_code():
+        try:
+            requests = _get_requests()
+            resp = requests.get(
+                f"{_RD_OAUTH_BASE}/device/code",
+                params={"client_id": _CLIENT_ID, "new_credentials": "yes"},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            fetch_result["data"] = resp.json()
+        except Exception as exc:
+            fetch_result["error"] = exc
+
+    t = threading.Thread(target=_fetch_device_code, daemon=True)
+    t.start()
+
+    # Wait on the background thread, updating busy dialog every 500ms
+    while t.is_alive():
+        if busy.iscanceled():
+            busy.close()
+            return False
+        busy.update(0, "Connecting to Real-Debrid…")
+        xbmc.sleep(500)
+
+    busy.close()
+
+    if "error" in fetch_result:
+        exc = fetch_result["error"]
         _log(f"Failed to get device code: {exc}", xbmc.LOGERROR)
         xbmcgui.Dialog().ok("KDMM", f"RD error: {type(exc).__name__}: {str(exc)[:200]}")
         return False
 
-    device_code = data["device_code"]
-    user_code = data["user_code"]
+    data = fetch_result.get("data", {})
+    device_code = data.get("device_code", "")
+    user_code = data.get("user_code", "")
+    if not device_code or not user_code:
+        xbmcgui.Dialog().ok("KDMM", "Unexpected response from Real-Debrid.")
+        return False
+
     interval = data.get("interval", 5)
     expires_in = data.get("expires_in", 600)
     verification_url = data.get("verification_url", "https://real-debrid.com/device")
     direct_url = data.get("direct_verification_url", verification_url)
 
-    # 2. Generate QR code image
+    # Start QR generation in background (non-blocking); dialog shows immediately
     qr_path = _generate_qr_image(direct_url)
 
-    # 3. Show dialog and poll
+    # Show dialog and poll (polling is also on a background thread in _show_auth_dialog)
     success = _show_auth_dialog(
         device_code=device_code,
         user_code=user_code,
@@ -129,104 +153,135 @@ def authorize():
 
 
 def _generate_qr_image(url):
-    """Generate a QR code PNG for the given URL. Returns the file path."""
+    """Generate a QR code PNG in a background thread. Returns path immediately."""
     userdata = xbmcvfs.translatePath(f"special://profile/addon_data/{_ADDON_ID}/")
     os.makedirs(userdata, exist_ok=True)
     qr_path = os.path.join(userdata, "rd_qr.png")
 
-    try:
-        import qrcode
-        img = qrcode.make(url, box_size=10, border=2)
-        img.save(qr_path)
-        _log(f"QR code saved to {qr_path}")
-        return qr_path
-    except Exception as exc:
-        _log(f"QR generation failed: {exc}", xbmc.LOGWARNING)
-        return None
+    def _gen():
+        try:
+            import qrcode
+            img = qrcode.make(url, box_size=10, border=2)
+            img.save(qr_path)
+            _log(f"QR code saved to {qr_path}")
+        except Exception as exc:
+            _log(f"QR generation failed: {exc}", xbmc.LOGWARNING)
+
+    threading.Thread(target=_gen, daemon=True).start()
+    return qr_path
 
 
 def _show_auth_dialog(device_code, user_code, verification_url, qr_image_path,
                       interval, expires_in):
     """
-    Show a custom dialog with QR code + user code, poll RD until
-    the user authorizes or cancels.
+    Show a progress dialog and poll RD for authorization.
+    All network calls run on a daemon thread; the main thread only updates
+    the dialog at 1-second ticks so Kodi's UI stays responsive.
     """
-    requests = _get_requests()
+    # Shared state between main thread and poller thread
+    result = {"status": "pending"}   # "pending" | "ok" | "error" | "timeout"
+    result_lock = threading.Lock()
 
+    def _poll_thread():
+        requests = _get_requests()
+        poll_url = f"{_RD_OAUTH_BASE}/device/credentials"
+        deadline = time.time() + expires_in
+
+        while time.time() < deadline:
+            with result_lock:
+                if result["status"] != "pending":
+                    return
+
+            time.sleep(interval)
+
+            with result_lock:
+                if result["status"] != "pending":
+                    return
+
+            try:
+                resp = requests.get(
+                    poll_url,
+                    params={"client_id": _CLIENT_ID, "code": device_code},
+                    timeout=10,
+                )
+            except Exception as exc:
+                _log(f"Poll request failed: {exc}", xbmc.LOGWARNING)
+                continue
+
+            if resp.status_code == 200:
+                creds = resp.json()
+                client_id = creds.get("client_id", _CLIENT_ID)
+                client_secret = creds.get("client_secret", "")
+                token_data = _exchange_code(client_id, client_secret, device_code)
+                with result_lock:
+                    if token_data:
+                        _save_tokens(client_id, client_secret, token_data)
+                        result["status"] = "ok"
+                    else:
+                        result["status"] = "error"
+                return
+            elif resp.status_code != 403:
+                _log(f"Unexpected poll response: {resp.status_code}", xbmc.LOGWARNING)
+
+        with result_lock:
+            if result["status"] == "pending":
+                result["status"] = "timeout"
+
+    # Start polling in background
+    t = threading.Thread(target=_poll_thread, daemon=True)
+    t.start()
+
+    # Show dialog; update every second on the main thread (non-blocking ticks)
     dialog = xbmcgui.DialogProgress()
     dialog.create(
         "KDMM – Link Real-Debrid",
         f"Go to: [B]{verification_url}[/B]\n"
-        f"Enter code: [B]{user_code}[/B]\n"
-        f"Or scan the QR code in your Kodi addon data folder."
+        f"Enter code: [B]{user_code}[/B]"
     )
 
-    # If we have a QR image, show it as a notification so the user sees it
-    if qr_image_path and os.path.isfile(qr_image_path):
-        xbmcgui.Dialog().notification(
-            "Scan QR Code", f"Code: {user_code}",
-            qr_image_path, 10000, False
-        )
-
     deadline = time.time() + expires_in
-    poll_url = f"{_RD_OAUTH_BASE}/device/credentials"
+    while True:
+        with result_lock:
+            status = result["status"]
 
-    while time.time() < deadline:
+        if status != "pending":
+            break
+
         if dialog.iscanceled():
-            dialog.close()
-            _log("User cancelled authorization")
-            return False
+            with result_lock:
+                result["status"] = "cancelled"
+            break
 
-        elapsed = int(time.time() + expires_in - deadline)
-        remaining = int(deadline - time.time())
+        remaining = max(0, int(deadline - time.time()))
+        elapsed = expires_in - remaining
         percent = min(99, int((elapsed / expires_in) * 100))
         dialog.update(
             percent,
             f"Go to: [B]{verification_url}[/B]\n"
             f"Enter code: [B]{user_code}[/B]\n"
-            f"Waiting for authorization… ({remaining}s remaining)"
+            f"Waiting… ({remaining}s remaining)"
         )
-
-        xbmc.sleep(interval * 1000)
-
-        # Poll for credentials
-        try:
-            resp = requests.get(
-                poll_url,
-                params={"client_id": _CLIENT_ID, "code": device_code},
-                timeout=10,
-            )
-        except Exception:
-            continue
-
-        if resp.status_code == 200:
-            creds = resp.json()
-            client_id = creds.get("client_id", _CLIENT_ID)
-            client_secret = creds.get("client_secret", "")
-
-            # Exchange device code for access token
-            token_data = _exchange_code(client_id, client_secret, device_code)
-            if token_data:
-                _save_tokens(client_id, client_secret, token_data)
-                dialog.close()
-                xbmcgui.Dialog().notification(
-                    "KDMM", "Real-Debrid authorized!",
-                    xbmcgui.NOTIFICATION_INFO, 3000
-                )
-                _log("Authorization successful")
-                return True
-            else:
-                dialog.close()
-                xbmcgui.Dialog().ok("KDMM", "Failed to get access token from Real-Debrid.")
-                return False
-
-        # 403 = still pending, anything else is an error
-        if resp.status_code != 403:
-            _log(f"Unexpected poll response: {resp.status_code}", xbmc.LOGWARNING)
+        xbmc.sleep(1000)  # 1-second tick — yields to Kodi UI
 
     dialog.close()
-    xbmcgui.Dialog().ok("KDMM", "Authorization timed out. Please try again.")
-    return False
+
+    with result_lock:
+        status = result["status"]
+
+    if status == "ok":
+        xbmcgui.Dialog().notification("KDMM", "Real-Debrid authorized!",
+                                      xbmcgui.NOTIFICATION_INFO, 3000)
+        _log("Authorization successful")
+        return True
+    elif status == "cancelled":
+        _log("User cancelled authorization")
+        return False
+    elif status == "timeout":
+        xbmcgui.Dialog().ok("KDMM", "Authorization timed out. Please try again.")
+        return False
+    else:
+        xbmcgui.Dialog().ok("KDMM", "Failed to get access token from Real-Debrid.")
+        return False
 
 
 def _exchange_code(client_id, client_secret, device_code):
