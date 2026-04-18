@@ -10,6 +10,12 @@
         <setting id="rd_refresh_token" type="text" label="" visible="false" default=""/>
         <setting id="rd_token_expiry" type="text" label="" visible="false" default="0"/>
     </category>
+    <category label="Quality">
+        <setting id="preferred_groups" type="text" label="Preferred release groups (comma-separated)" default="FraMeSToR,Cinephiles,TRITON"/>
+        <setting id="hdr_priority" type="enum" label="HDR preference" values="Dolby Vision|HDR10+|HDR10|Any HDR|SDR only" default="0"/>
+        <setting id="resolution_priority" type="enum" label="Resolution preference" values="4K (2160p)|1080p|720p" default="0"/>
+        <setting id="source_priority" type="enum" label="Source preference" values="Remux|BluRay encode|WEB|Any" default="0"/>
+    </category>
     <category label="Cache">
         <setting id="stream_cache_ttl_hours" type="number" label="Stream cache duration (hours)" default="6"/>
         <setting id="notify_cache_hit" type="bool" label="Notify on cache hit" default="false"/>

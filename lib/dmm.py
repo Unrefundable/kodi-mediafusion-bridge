@@ -15,6 +15,7 @@ Flow:
 """
 
 import math
+import re
 import sys
 import os
 import time as _time
@@ -28,11 +29,172 @@ _DMM_SALT = "debridmediamanager.com%%fe7#td00rA3vHz%VmI"
 _DMM_BASE = "https://debridmediamanager.com"
 _RD_BASE = "https://api.real-debrid.com/rest/1.0"
 
-# Remux groups known for high-quality encode / remux work.
-_PREFERRED_GROUPS = ("framestor", "cinephiles", "triton")
-
 # Minimum file size to distinguish real content from RD error clips.
 _MIN_STREAM_BYTES = 50 * 1024 * 1024  # 50 MB
+
+
+# ------------------------------------------------------------------ #
+# Title parser — extract quality metadata from torrent names
+# ------------------------------------------------------------------ #
+
+# HDR tiers (lower = better)
+_HDR_DV = 0       # Dolby Vision (may include DV + HDR10 combo)
+_HDR_HDR10P = 1   # HDR10+
+_HDR_HDR10 = 2    # HDR10
+_HDR_HDR = 3      # Generic HDR
+_HDR_SDR = 4      # No HDR info → SDR
+
+# Resolution tiers
+_RES_2160 = 0
+_RES_1080 = 1
+_RES_720 = 2
+_RES_SD = 3
+
+# Source tiers
+_SRC_REMUX = 0
+_SRC_BLURAY = 1   # BluRay encode (not remux)
+_SRC_WEB = 2      # WEB-DL / WEBRip
+_SRC_HDTV = 3
+_SRC_OTHER = 4
+
+
+def _parse_title(title):
+    """
+    Parse a torrent title and return a dict of quality attributes.
+    All matching is case-insensitive against the raw title.
+    """
+    t = title.lower()
+
+    # --- HDR format ---
+    if "dovi" in t or "dolby.vision" in t or "dolbyvision" in t or \
+       re.search(r'\bdo?v\b', t) or "dolby vision" in t:
+        hdr = _HDR_DV
+    elif "hdr10+" in t or "hdr10plus" in t or "hdr10 plus" in t:
+        hdr = _HDR_HDR10P
+    elif "hdr10" in t:
+        hdr = _HDR_HDR10
+    elif re.search(r'\bhdr\b', t):
+        hdr = _HDR_HDR
+    else:
+        hdr = _HDR_SDR
+
+    # --- Resolution ---
+    if "2160p" in t or "4k" in t or "uhd" in t:
+        res = _RES_2160
+    elif "1080p" in t or "1080i" in t:
+        res = _RES_1080
+    elif "720p" in t:
+        res = _RES_720
+    else:
+        res = _RES_SD
+
+    # --- Source ---
+    if "remux" in t:
+        src = _SRC_REMUX
+    elif re.search(r'\bblu[\-\.]?ray\b', t) or "bdremux" in t or "bd full" in t \
+            or re.search(r'complete.*bluray', t) or ".iso" in t:
+        src = _SRC_BLURAY
+    elif re.search(r'web[\-\.]?dl', t) or re.search(r'webrip', t) or re.search(r'\bweb\b', t):
+        src = _SRC_WEB
+    elif "hdtv" in t:
+        src = _SRC_HDTV
+    else:
+        src = _SRC_OTHER
+
+    # --- Release group (last segment after hyphen) ---
+    group_match = re.search(r'-([A-Za-z0-9]+)(?:\.[a-z]{2,4})?$', title)
+    group = group_match.group(1).lower() if group_match else ""
+
+    return {
+        "hdr": hdr,
+        "res": res,
+        "src": src,
+        "group": group,
+    }
+
+
+def _get_quality_preferences():
+    """Read quality preferences from addon settings."""
+    addon = xbmcaddon.Addon()
+
+    # Preferred groups
+    groups_raw = addon.getSetting("preferred_groups") or "FraMeSToR,Cinephiles,TRITON"
+    preferred_groups = [g.strip().lower() for g in groups_raw.split(",") if g.strip()]
+
+    # HDR preference (0=DV, 1=HDR10+, 2=HDR10, 3=Any HDR, 4=SDR only)
+    hdr_pref = int(addon.getSetting("hdr_priority") or "0")
+
+    # Resolution preference (0=4K, 1=1080p, 2=720p)
+    res_pref = int(addon.getSetting("resolution_priority") or "0")
+
+    # Source preference (0=Remux, 1=BluRay, 2=WEB, 3=Any)
+    src_pref = int(addon.getSetting("source_priority") or "0")
+
+    return preferred_groups, hdr_pref, res_pref, src_pref
+
+
+def _build_sort_key(preferred_groups, hdr_pref, res_pref, src_pref):
+    """
+    Return a sort-key function for DMM results that respects user prefs.
+
+    Sort priority (lower = better):
+      1. Preferred release group (0 = match, 1 = no match)
+      2. HDR tier (mapped so user's preferred HDR is tier 0)
+      3. Resolution tier (mapped so user's preferred res is tier 0)
+      4. Source tier (mapped so user's preferred source is tier 0)
+      5. File size descending (larger = better quality)
+
+    This ensures preferred group always wins. Within same group,
+    the best HDR → resolution → source → size is picked.
+    """
+    # Build HDR remap: user's preference gets score 0, others ranked after
+    hdr_order = {
+        0: [_HDR_DV, _HDR_HDR10P, _HDR_HDR10, _HDR_HDR, _HDR_SDR],      # DV first
+        1: [_HDR_HDR10P, _HDR_DV, _HDR_HDR10, _HDR_HDR, _HDR_SDR],      # HDR10+ first
+        2: [_HDR_HDR10, _HDR_HDR10P, _HDR_DV, _HDR_HDR, _HDR_SDR],      # HDR10 first
+        3: [_HDR_DV, _HDR_HDR10P, _HDR_HDR10, _HDR_HDR, _HDR_SDR],      # Any HDR (DV > 10+ > 10)
+        4: [_HDR_SDR, _HDR_DV, _HDR_HDR10P, _HDR_HDR10, _HDR_HDR],      # SDR only
+    }.get(hdr_pref, [_HDR_DV, _HDR_HDR10P, _HDR_HDR10, _HDR_HDR, _HDR_SDR])
+    hdr_rank = {v: i for i, v in enumerate(hdr_order)}
+
+    # Resolution remap
+    res_order = {
+        0: [_RES_2160, _RES_1080, _RES_720, _RES_SD],   # 4K first
+        1: [_RES_1080, _RES_2160, _RES_720, _RES_SD],   # 1080p first
+        2: [_RES_720, _RES_1080, _RES_2160, _RES_SD],   # 720p first
+    }.get(res_pref, [_RES_2160, _RES_1080, _RES_720, _RES_SD])
+    res_rank = {v: i for i, v in enumerate(res_order)}
+
+    # Source remap
+    src_order = {
+        0: [_SRC_REMUX, _SRC_BLURAY, _SRC_WEB, _SRC_HDTV, _SRC_OTHER],
+        1: [_SRC_BLURAY, _SRC_REMUX, _SRC_WEB, _SRC_HDTV, _SRC_OTHER],
+        2: [_SRC_WEB, _SRC_REMUX, _SRC_BLURAY, _SRC_HDTV, _SRC_OTHER],
+        3: [_SRC_REMUX, _SRC_BLURAY, _SRC_WEB, _SRC_HDTV, _SRC_OTHER],  # Any = default order
+    }.get(src_pref, [_SRC_REMUX, _SRC_BLURAY, _SRC_WEB, _SRC_HDTV, _SRC_OTHER])
+    src_rank = {v: i for i, v in enumerate(src_order)}
+
+    def _sort_key(entry):
+        title = entry.get("title") or ""
+        parsed = _parse_title(title)
+        size = entry.get("fileSize") or entry.get("filesize") or 0
+
+        # Is this a preferred group?
+        group_prio = 1
+        for g in preferred_groups:
+            if g in parsed["group"] or g in title.lower():
+                group_prio = 0
+                break
+
+        return (
+            group_prio,
+            hdr_rank.get(parsed["hdr"], 99),
+            res_rank.get(parsed["res"], 99),
+            src_rank.get(parsed["src"], 99),
+            -size,  # larger = better
+        )
+
+    return _sort_key
 
 
 def _log(msg, level=xbmc.LOGINFO):
@@ -338,8 +500,17 @@ def _try_resolve_one(candidate, api_token, season, episode, cancel_event):
         if _cancelled(cancel_event):
             return None
 
+        # addMagnet with 429 retry
         magnet = f"magnet:?xt=urn:btih:{candidate['hash']}"
-        resp = _rd_post("/torrents/addMagnet", api_token, data={"magnet": magnet})
+        for attempt in range(3):
+            try:
+                resp = _rd_post("/torrents/addMagnet", api_token, data={"magnet": magnet})
+                break
+            except Exception as e:
+                if "429" in str(e) and attempt < 2:
+                    _time.sleep(1.0 * (attempt + 1))
+                    continue
+                raise
         rd_id = resp.get("id")
         if not rd_id:
             _log(f"{h8} addMagnet returned no id")
@@ -436,48 +607,58 @@ def _resolve_by_direct_add(candidates_info, api_token, season=None, episode=None
                            max_resolve=1, cancel_event=None):
     """
     Resolve streams by adding magnets to RD and checking for instant cache.
-    Runs candidates in PARALLEL (up to 5 threads), returns as soon as
-    max_resolve streams are found.
+    Runs candidates in PARALLEL in batches of 3 (to avoid RD 429 rate-limits),
+    returns as soon as max_resolve streams are found.
     """
     from concurrent.futures import ThreadPoolExecutor, as_completed
     import threading
 
     resolved = []
-    # Internal event to signal "we have enough, stop other threads"
     enough_event = threading.Event()
 
-    # Combine both cancel signals
-    def _should_stop():
-        return _cancelled(cancel_event) or enough_event.is_set()
-
-    # Wrap cancel_event so workers check both
     class _CombinedEvent:
         def is_set(self):
-            return _should_stop()
+            return _cancelled(cancel_event) or enough_event.is_set()
         def set(self):
             enough_event.set()
 
     combined = _CombinedEvent()
 
-    _log(f"Resolving {len(candidates_info)} candidates in parallel (need {max_resolve})")
+    _log(f"Resolving {len(candidates_info)} candidates in batches of 3 (need {max_resolve})")
 
-    with ThreadPoolExecutor(max_workers=5) as pool:
-        futures = {
-            pool.submit(
-                _try_resolve_one, c, api_token, season, episode, combined
-            ): c
-            for c in candidates_info
-        }
-        for future in as_completed(futures):
-            result = future.result()
-            if result:
-                resolved.append(result)
-                if len(resolved) >= max_resolve:
+    # Process in batches of 3 to avoid RD rate limits
+    batch_size = 3
+    for batch_start in range(0, len(candidates_info), batch_size):
+        if _cancelled(cancel_event) or enough_event.is_set():
+            break
+
+        batch = candidates_info[batch_start:batch_start + batch_size]
+        _log(f"Batch {batch_start // batch_size + 1}: candidates {batch_start + 1}-{batch_start + len(batch)}")
+
+        with ThreadPoolExecutor(max_workers=batch_size) as pool:
+            futures = {
+                pool.submit(
+                    _try_resolve_one, c, api_token, season, episode, combined
+                ): c
+                for c in batch
+            }
+            for future in as_completed(futures):
+                result = future.result()
+                if result:
+                    resolved.append(result)
+                    if len(resolved) >= max_resolve:
+                        enough_event.set()
+                        break
+                if _cancelled(cancel_event):
                     enough_event.set()
                     break
-            if _cancelled(cancel_event):
-                enough_event.set()
-                break
+
+        if enough_event.is_set():
+            break
+
+        # Small stagger between batches to avoid 429
+        if batch_start + batch_size < len(candidates_info):
+            _time.sleep(0.3)
 
     return resolved
 
@@ -607,6 +788,12 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None):
     season = parts[1] if len(parts) > 1 else None
     episode = parts[2] if len(parts) > 2 else None
 
+    # Pre-warm the session (SSL handshake) with a fast RD endpoint
+    try:
+        _get_session().head(f"{_RD_BASE}/time", headers=_rd_headers(api_token), timeout=3)
+    except Exception:
+        pass
+
     # 1. Get all hashes from DMM
     try:
         dmm_results = _fetch_dmm_hashes(
@@ -642,18 +829,22 @@ def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None):
             xbmcgui.NOTIFICATION_WARNING, 5000)
         return []
 
-    # 2. Sort candidates by preferred groups + file size and resolve directly
-    def _sort_key(entry):
-        name = (entry.get("title") or "").lower()
-        group_prio = 0 if any(g in name for g in _PREFERRED_GROUPS) else 1
-        size = entry.get("fileSize") or entry.get("filesize") or 0
-        return (group_prio, -size)
+    # 2. Sort candidates using quality preferences from settings
+    preferred_groups, hdr_pref, res_pref, src_pref = _get_quality_preferences()
+    sort_key = _build_sort_key(preferred_groups, hdr_pref, res_pref, src_pref)
 
-    sorted_dmm = sorted(dmm_results, key=_sort_key)
+    sorted_dmm = sorted(dmm_results, key=sort_key)
+
+    # Log the top picks so user can verify ranking
+    for i, r in enumerate(sorted_dmm[:5]):
+        parsed = _parse_title(r.get("title", ""))
+        _log(f"  #{i+1}: {r.get('title','?')[:80]} "
+             f"[hdr={parsed['hdr']} res={parsed['res']} src={parsed['src']} grp={parsed['group']}]")
+
     candidates = [
         {"hash": (r.get("hash") or "").lower(), "title": r.get("title", "Unknown")}
         for r in sorted_dmm if len((r.get("hash") or "")) == 40
-    ][:10]  # top 10 by quality, resolve up to 3
+    ][:20]  # top 20 by quality
 
     _log(f"DMM returned {len(hash_map)} hashes, checking top {len(candidates)} in parallel on RD")
 
