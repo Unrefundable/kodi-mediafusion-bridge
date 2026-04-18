@@ -294,11 +294,13 @@ def _availability_is_usable(api_token, hashes):
         return {}, False
 
 
-def _resolve_by_direct_add(candidates_info, api_token, season=None, episode=None, max_resolve=10):
+def _resolve_by_direct_add(candidates_info, api_token, season=None, episode=None,
+                           max_resolve=3, cancel_event=None):
     """
-    Resolve streams by adding magnets to RD directly and checking if
-    status is 'downloaded' (cached). Skips non-cached torrents.
-    This is the fallback when instantAvailability returns nothing.
+    Resolve streams by adding magnets to RD and checking for instant cache.
+    Uses tight 5s timeouts per request.  Checks at most `len(candidates_info)`
+    candidates (caller should already limit to 5).
+    cancel_event: threading.Event – set it to abort early.
     """
     import time as _t
     resolved = []
@@ -310,86 +312,96 @@ def _resolve_by_direct_add(candidates_info, api_token, season=None, episode=None
             f"{season}x{int(episode):02d}",
         ]
 
-    for c in candidates_info:
+    for idx, c in enumerate(candidates_info):
+        if cancel_event and cancel_event.is_set():
+            _log("Direct-add cancelled")
+            break
         if len(resolved) >= max_resolve:
             break
+
         rd_id = None
+        _log(f"Direct-add attempt {idx+1}/{len(candidates_info)}: {c['hash'][:8]}…")
         try:
             magnet = f"magnet:?xt=urn:btih:{c['hash']}"
-            resp = _rd_post("/torrents/addMagnet", api_token, data={"magnet": magnet})
+            resp = _rd_post("/torrents/addMagnet", api_token,
+                            data={"magnet": magnet}, timeout=8)
             rd_id = resp.get("id")
             if not rd_id:
                 continue
 
-            # Get torrent info to find file list before selecting
-            info = _rd_get(f"/torrents/info/{rd_id}", api_token)
-            if info.get("status") not in ("waiting_files_selection", "downloaded"):
-                _rd_delete(f"/torrents/delete/{rd_id}", api_token)
-                continue
+            info = _rd_get(f"/torrents/info/{rd_id}", api_token, timeout=8)
+            status = info.get("status", "")
 
-            # Pick the best file
-            files = info.get("files") or []
-            best_file_id = None
-            best_size = 0
-            for f in files:
-                fname = f.get("path", "").lower()
-                fsize = f.get("bytes", 0)
-                if not any(fname.endswith(e) for e in video_exts):
-                    continue
-                if ep_markers and not any(m in fname for m in ep_markers):
-                    continue
-                if fsize > best_size:
-                    best_size = fsize
-                    best_file_id = f.get("id")
-
-            if not best_file_id:
-                # No episode match – pick biggest video file
+            # If already downloaded (was in cache), skip file selection
+            if status == "downloaded":
+                pass  # fall through to link handling below
+            elif status == "waiting_files_selection":
+                # Pick the best video file
+                files = info.get("files") or []
+                best_file_id = None
+                best_size = 0
                 for f in files:
                     fname = f.get("path", "").lower()
                     fsize = f.get("bytes", 0)
-                    if any(fname.endswith(e) for e in video_exts) and fsize > best_size:
+                    if not any(fname.endswith(e) for e in video_exts):
+                        continue
+                    if ep_markers and not any(m in fname for m in ep_markers):
+                        continue
+                    if fsize > best_size:
                         best_size = fsize
                         best_file_id = f.get("id")
+                if not best_file_id:
+                    for f in files:
+                        fname = f.get("path", "").lower()
+                        fsize = f.get("bytes", 0)
+                        if any(fname.endswith(e) for e in video_exts) and fsize > best_size:
+                            best_size = fsize
+                            best_file_id = f.get("id")
+                if not best_file_id:
+                    _rd_delete(f"/torrents/delete/{rd_id}", api_token, timeout=5)
+                    continue
 
-            if not best_file_id:
-                _rd_delete(f"/torrents/delete/{rd_id}", api_token)
-                continue
-
-            _rd_post(f"/torrents/selectFiles/{rd_id}", api_token,
-                     data={"files": str(best_file_id)})
-            _t.sleep(1)
-            info = _rd_get(f"/torrents/info/{rd_id}", api_token)
-
-            if info.get("status") != "downloaded":
-                _log(f"Hash {c['hash'][:8]} not cached (status={info.get('status')!r}), skipping")
-                _rd_delete(f"/torrents/delete/{rd_id}", api_token)
+                _rd_post(f"/torrents/selectFiles/{rd_id}", api_token,
+                         data={"files": str(best_file_id)}, timeout=8)
+                _t.sleep(1.5)
+                info = _rd_get(f"/torrents/info/{rd_id}", api_token, timeout=8)
+                if info.get("status") != "downloaded":
+                    _log(f"{c['hash'][:8]} not cached (status={info.get('status')!r})")
+                    _rd_delete(f"/torrents/delete/{rd_id}", api_token, timeout=5)
+                    continue
+            else:
+                # Not cached – magnet_conversion / queued / etc.
+                _log(f"{c['hash'][:8]} status={status!r} – not instantly cached")
+                _rd_delete(f"/torrents/delete/{rd_id}", api_token, timeout=5)
                 continue
 
             links = info.get("links") or []
             if not links:
-                _rd_delete(f"/torrents/delete/{rd_id}", api_token)
+                _rd_delete(f"/torrents/delete/{rd_id}", api_token, timeout=5)
                 continue
 
-            unrestrict = _rd_post("/unrestrict/link", api_token, data={"link": links[0]})
+            unrestrict = _rd_post("/unrestrict/link", api_token,
+                                   data={"link": links[0]}, timeout=8)
             url = unrestrict.get("download")
             filename = unrestrict.get("filename", c.get("title", "Stream"))
-            _rd_delete(f"/torrents/delete/{rd_id}", api_token)
+            _rd_delete(f"/torrents/delete/{rd_id}", api_token, timeout=5)
 
             if url:
-                _log(f"Direct resolve OK: {filename!r}")
+                _log(f"Direct-add resolve OK: {filename!r}")
                 resolved.append({"url": url, "headers": {}, "name": filename})
 
         except Exception as exc:
-            _log(f"Direct resolve failed for {c.get('hash','')[:8]}: {exc}", xbmc.LOGWARNING)
+            _log(f"Direct-add failed for {c.get('hash','')[:8]}: {exc}", xbmc.LOGWARNING)
             if rd_id:
                 try:
-                    _rd_delete(f"/torrents/delete/{rd_id}", api_token)
+                    _rd_delete(f"/torrents/delete/{rd_id}", api_token, timeout=5)
                 except Exception:
                     pass
 
     return resolved
 
 
+# ------------------------------------------------------------------ #
 # ------------------------------------------------------------------ #
 # RD stream resolution (hash → playable URL)
 # ------------------------------------------------------------------ #
@@ -487,7 +499,7 @@ def is_stream_accessible(url, headers):
         return True
 
 
-def fetch_all_cached_streams(catalog_type, video_id):
+def fetch_all_cached_streams(catalog_type, video_id, cancel_event=None):
     """
     Main entry point.  Queries DMM's hash database, checks RD availability,
     resolves each cached hash to a direct-play URL, and returns a sorted
@@ -571,15 +583,16 @@ def fetch_all_cached_streams(catalog_type, video_id):
         # instantAvailability returned nothing – fall back to direct-add approach
         _log("instantAvailability returned 0 results, trying direct-add fallback…")
         xbmcgui.Dialog().notification(
-            "KDMM", f"Checking {min(20, len(hash_map))} streams directly on RD…",
+            "KDMM", f"Checking top 5 streams directly on RD…",
             xbmcgui.NOTIFICATION_INFO, 4000)
         sorted_dmm = sorted(dmm_results, key=_sort_key)
         candidates_direct = [
             {"hash": (r.get("hash") or "").lower(), "title": r.get("title", "Unknown")}
             for r in sorted_dmm if len((r.get("hash") or "")) == 40
-        ][:20]
+        ][:5]  # only top 5 — each needs multiple round-trips
         resolved = _resolve_by_direct_add(
-            candidates_direct, api_token, season=season, episode=episode
+            candidates_direct, api_token, season=season, episode=episode,
+            cancel_event=cancel_event,
         )
         if not resolved:
             xbmcgui.Dialog().notification(

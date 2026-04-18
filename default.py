@@ -193,10 +193,12 @@ def action_play(params):
         _log(f"Cache miss – querying DMM + RD for {media_id}")
 
         fetch_result = {}
+        cancel_event = threading.Event()
 
         def _fetch():
             try:
-                fetch_result["candidates"] = fetch_all_cached_streams(catalog_type, video_id)
+                fetch_result["candidates"] = fetch_all_cached_streams(
+                    catalog_type, video_id, cancel_event=cancel_event)
             except Exception as exc:
                 fetch_result["error"] = exc
 
@@ -208,6 +210,7 @@ def action_play(params):
         dots = 0
         while t.is_alive():
             if busy_dialog.iscanceled():
+                cancel_event.set()
                 busy_dialog.close()
                 xbmcplugin.setResolvedUrl(ADDON_HANDLE, False, xbmcgui.ListItem())
                 return
